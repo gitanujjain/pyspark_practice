@@ -1,0 +1,346 @@
+from hl7py import Parser, ValidationError
+from typing import List, Dict, Optional
+import re
+from datetime import datetime
+
+class ORU_R01Validator:
+    def __init__(self):
+        self.parser = Parser()
+        self.errors = []
+        self.warnings = []
+    
+    def validate_oru_r01(self, hl7_message: str) -> bool:
+        """
+        Comprehensive validation for ORU_R01 messages
+        """
+        self.errors = []
+        self.warnings = []
+        
+        try:
+            message = self.parser.parse(hl7_message)
+            
+            # Validate message structure and required segments
+            self._validate_message_structure(message)
+            self._validate_msh_segment(message)
+            self._validate_patient_section(message)
+            self._validate_order_section(message)
+            self._validate_observation_section(message)
+            self._validate_cross_field_relationships(message)
+            
+            return len(self.errors) == 0
+            
+        except ValidationError as e:
+            self.errors.append(f"HL7 Validation Error: {e}")
+            return False
+        except Exception as e:
+            self.errors.append(f"Unexpected error: {e}")
+            return False
+    
+    def _validate_message_structure(self, message):
+        """Validate ORU_R01 specific segment structure"""
+        required_segments = ['MSH', 'PID', 'PV1', 'ORC', 'OBR', 'OBX']
+        
+        for segment in required_segments:
+            if segment not in message:
+                self.errors.append(f"Required segment {segment} is missing")
+        
+        # Check for at least one OBX segment
+        obx_segments = [seg for seg in message.segments if seg.name == 'OBX']
+        if not obx_segments:
+            self.errors.append("At least one OBX segment is required for ORU_R01")
+    
+    def _validate_msh_segment(self, message):
+        """Validate MSH segment for ORU_R01"""
+        msh = message['MSH']
+        
+        # Required fields validation
+        required_fields = {
+            1: "Field Separator",
+            2: "Encoding Characters", 
+            3: "Sending Application",
+            4: "Sending Facility",
+            5: "Receiving Application",
+            6: "Receiving Facility",
+            7: "DateTime of Message",
+            9: "Message Type",
+            10: "Message Control ID",
+            11: "Processing ID",
+            12: "Version ID"
+        }
+        
+        for field_num, field_desc in required_fields.items():
+            if not msh[field_num] or not msh[field_num].value:
+                self.errors.append(f"MSH.{field_num} ({field_desc}) is required")
+        
+        # Message type specific validation
+        if msh[9]:
+            msg_type = msh[9].value
+            if msg_type != 'ORU^R01':
+                self.warnings.append(f"Expected message type ORU^R01, found {msg_type}")
+        
+        # Version validation
+        if msh[12] and msh[12].value:
+            version = msh[12].value
+            if version not in ['2.3', '2.4', '2.5', '2.5.1', '2.6', '2.7', '2.8', '2.8.1', '2.8.2']:
+                self.warnings.append(f"Unsupported HL7 version: {version}")
+        
+        # DateTime format validation
+        if msh[7] and msh[7].value:
+            self._validate_timestamp(msh[7].value, "MSH.7")
+    
+    def _validate_patient_section(self, message):
+        """Validate patient identification and visit segments"""
+        # PID segment validation
+        if 'PID' in message:
+            pid = message['PID']
+            
+            # Required PID fields
+            pid_required = {
+                3: "Patient Identifier List",
+                5: "Patient Name",
+                7: "Date/Time of Birth",
+                8: "Sex"
+            }
+            
+            for field_num, field_desc in pid_required.items():
+                if not pid[field_num] or not pid[field_num].value:
+                    self.errors.append(f"PID.{field_num} ({field_desc}) is required")
+            
+            # Patient identifier validation
+            if pid[3]:
+                for identifier in pid[3]:
+                    if identifier.components and len(identifier.components) >= 1:
+                        id_value = identifier.components[0].value if identifier.components[0] else ""
+                        if not id_value:
+                            self.errors.append("PID.3 patient identifier value is required")
+            
+            # Date of birth validation
+            if pid[7] and pid[7].value:
+                self._validate_timestamp(pid[7].value, "PID.7")
+            
+            # Sex validation
+            if pid[8] and pid[8].value:
+                valid_sex_codes = ['M', 'F', 'O', 'U', 'A', 'N']
+                if pid[8].value not in valid_sex_codes:
+                    self.warnings.append(f"PID.8 sex code '{pid[8].value}' not in standard values {valid_sex_codes}")
+        
+        # PV1 segment validation
+        if 'PV1' in message:
+            pv1 = message['PV1']
+            
+            # Required PV1 fields
+            if not pv1[2] or not pv1[2].value:
+                self.errors.append("PV1.2 (Patient Class) is required")
+            
+            # Patient class validation
+            if pv1[2] and pv1[2].value:
+                valid_classes = ['I', 'O', 'E', 'P', 'R', 'B', 'C', 'N', 'U']
+                if pv1[2].value not in valid_classes:
+                    self.warnings.append(f"PV1.2 patient class '{pv1[2].value}' not in standard values {valid_classes}")
+    
+    def _validate_order_section(self, message):
+        """Validate ORC and OBR segments"""
+        # ORC segment validation (optional but recommended)
+        if 'ORC' in message:
+            orc = message['ORC']
+            
+            if orc[1] and orc[1].value:
+                valid_order_controls = ['NW', 'OK', 'UA', 'CA', 'OC', 'CR', 'UC', 'DC', 'HD', 'HR']
+                if orc[1].value not in valid_order_controls:
+                    self.warnings.append(f"ORC.1 order control '{orc[1].value}' not in standard values {valid_order_controls}")
+        
+        # OBR segment validation
+        if 'OBR' in message:
+            obr = message['OBR']
+            
+            # Required OBR fields
+            obr_required = {
+                2: "Placer Order Number",
+                3: "Filler Order Number", 
+                4: "Universal Service Identifier",
+                7: "Observation Date/Time",
+                25: "Result Status"
+            }
+            
+            for field_num, field_desc in obr_required.items():
+                if not obr[field_num] or not obr[field_num].value:
+                    self.errors.append(f"OBR.{field_num} ({field_desc}) is required")
+            
+            # Result status validation
+            if obr[25] and obr[25].value:
+                valid_statuses = ['O', 'I', 'S', 'A', 'P', 'C', 'R', 'N', 'D', 'X', 'Y', 'Z']
+                if obr[25].value not in valid_statuses:
+                    self.warnings.append(f"OBR.25 result status '{obr[25].value}' not in standard values {valid_statuses}")
+            
+            # DateTime validation
+            if obr[7] and obr[7].value:
+                self._validate_timestamp(obr[7].value, "OBR.7")
+            
+            # Priority validation if present
+            if obr[5] and obr[5].value:
+                valid_priorities = ['S', 'A', 'R', 'P', 'C', 'T', 'NULL']
+                if obr[5].value not in valid_priorities:
+                    self.warnings.append(f"OBR.5 priority '{obr[5].value}' not in standard values {valid_priorities}")
+    
+    def _validate_observation_section(self, message):
+        """Validate OBX segments"""
+        obx_segments = [seg for seg in message.segments if seg.name == 'OBX']
+        
+        for i, obx in enumerate(obx_segments):
+            obx_index = i + 1
+            
+            # Required OBX fields
+            obx_required = {
+                1: "Set ID",
+                2: "Value Type",
+                3: "Observation Identifier",
+                5: "Observation Value",
+                11: "Observation Result Status"
+            }
+            
+            for field_num, field_desc in obx_required.items():
+                if not obx[field_num] or not obx[field_num].value:
+                    self.errors.append(f"OBX[{obx_index}].{field_num} ({field_desc}) is required")
+            
+            # Value type validation
+            if obx[2] and obx[2].value:
+                valid_value_types = ['ST', 'TX', 'FT', 'NM', 'SN', 'DT', 'TM', 'TS', 'IS', 'CE', 'CWE', 'RP', 'RP']
+                if obx[2].value not in valid_value_types:
+                    self.warnings.append(f"OBX[{obx_index}].2 value type '{obx[2].value}' not in standard values {valid_value_types}")
+            
+            # Result status validation
+            if obx[11] and obx[11].value:
+                valid_statuses = ['F', 'N', 'D', 'X', 'C', 'R', 'S', 'P', 'A']
+                if obx[11].value not in valid_statuses:
+                    self.warnings.append(f"OBX[{obx_index}].11 result status '{obx[11].value}' not in standard values {valid_statuses}")
+            
+            # Units validation if present
+            if obx[6] and obx[6].value:
+                # Basic unit format check
+                if not re.match(r'^[A-Za-z0-9°%/\\.]+$', obx[6].value):
+                    self.warnings.append(f"OBX[{obx_index}].6 units format may be invalid: {obx[6].value}")
+            
+            # Reference ranges validation if present
+            if obx[7] and obx[7].value:
+                # Check for proper reference range format
+                ref_range = obx[7].value
+                if not re.match(r'^[\d\.]+\s*-\s*[\d\.]+$', ref_range) and not re.match(r'^[<>]\s*[\d\.]+$', ref_range):
+                    self.warnings.append(f"OBX[{obx_index}].7 reference range format may be invalid: {ref_range}")
+    
+    def _validate_cross_field_relationships(self, message):
+        """Validate relationships between different segments and fields"""
+        # Check that OBR and OBX placer/filler order numbers match if ORC is present
+        if 'ORC' in message and 'OBR' in message:
+            orc = message['ORC']
+            obr = message['OBR']
+            
+            # Placer order number consistency
+            if orc[2] and obr[2] and orc[2].value != obr[2].value:
+                self.warnings.append("ORC.2 and OBR.2 placer order numbers should match")
+            
+            # Filler order number consistency  
+            if orc[3] and obr[3] and orc[3].value != obr[3].value:
+                self.warnings.append("ORC.3 and OBR.3 filler order numbers should match")
+        
+        # Check OBX observation identifiers are valid LOINC or local codes
+        obx_segments = [seg for seg in message.segments if seg.name == 'OBX']
+        for obx in obx_segments:
+            if obx[3] and obx[3].value:
+                obs_id = obx[3].value
+                # Basic check for observation identifier format
+                if '^' not in obs_id:
+                    self.warnings.append(f"OBX observation identifier should use component separator: {obs_id}")
+    
+    def _validate_timestamp(self, timestamp: str, field_location: str):
+        """Validate HL7 timestamp format"""
+        # Basic timestamp format validation (YYYYMMDDHHMMSS[.SSSS][+/-ZZZZ])
+        timestamp_pattern = r'^\d{4}([01]\d[0-3]\d)([0-2]\d[0-5]\d([0-5]\d)?)?(\.\d+)?([+-]\d{4})?$'
+        
+        if not re.match(timestamp_pattern, timestamp):
+            self.warnings.append(f"{field_location} timestamp format may be invalid: {timestamp}")
+        
+        # Try to parse the date for additional validation
+        try:
+            # Extract just the date part for validation
+            date_part = timestamp[:8]
+            if len(date_part) == 8:
+                datetime.strptime(date_part, '%Y%m%d')
+        except ValueError:
+            self.warnings.append(f"{field_location} contains invalid date: {timestamp}")
+    
+    def get_validation_report(self) -> Dict:
+        """Generate comprehensive validation report"""
+        return {
+            'is_valid': len(self.errors) == 0,
+            'error_count': len(self.errors),
+            'warning_count': len(self.warnings),
+            'errors': self.errors,
+            'warnings': self.warnings
+        }
+    
+    def print_validation_report(self):
+        """Print formatted validation report"""
+        report = self.get_validation_report()
+        
+        if report['is_valid']:
+            print("✅ ORU_R01 Message is VALID")
+        else:
+            print("❌ ORU_R01 Message is INVALID")
+        
+        if report['errors']:
+            print("\nErrors:")
+            for error in report['errors']:
+                print(f"  ❌ {error}")
+        
+        if report['warnings']:
+            print("\nWarnings:")
+            for warning in report['warnings']:
+                print(f"  ⚠️  {warning}")
+        
+        print(f"\nSummary: {report['error_count']} errors, {report['warning_count']} warnings")
+
+# Example Usage with Sample ORU_R01 Message
+def main():
+    validator = ORU_R01Validator()
+    
+    # Sample ORU_R01 message
+    oru_r01_message = """MSH|^~\\&|LAB_SYSTEM|LAB_FACILITY|HIS_SYSTEM|HOSPITAL|20240101143000||ORU^R01|MSG12345|P|2.5.1|||AL|NE
+PID|1|12345^^^HOSP^MR|12345^^^HOSP^MR||PATIENT^SAMPLE^J||19850101|M|||123 MAIN ST^^CITY^ST^12345||(555)123-4567|||S||123456789|
+PV1|1|O|OPD^101^^^HOSP||||123456^DOCTOR^JOHN^^^^^^MD|||SUR||||2|||||||||||||||||||||20240101100000|
+ORC|NW|PLACER123|FILLER456|||||||||||123456^DOCTOR^JOHN^^^^^^MD|
+OBR|1|PLACER123|FILLER456|LAB1234^COMPLETE BLOOD COUNT^LN|||20240101140000|||||||||||||||||||||F||||||||||C|20240101143000|
+OBX|1|NM|WBC^White Blood Cell Count^LN||7.5|10*3/uL|4.0-11.0|||F|||20240101141500|
+OBX|2|NM|RBC^Red Blood Cell Count^LN||4.5|10*6/uL|4.2-5.8|||F|||20240101141500|
+OBX|3|NM|HGB^Hemoglobin^LN||14.0|g/dL|13.0-17.0|||F|||20240101141500|
+OBX|4|NM|HCT^Hematocrit^LN||42.0|%|39.0-50.0|||F|||20240101141500|"""
+    
+    # Validate the message
+    is_valid = validator.validate_oru_r01(oru_r01_message)
+    
+    # Print results
+    validator.print_validation_report()
+    
+    return validator.get_validation_report()
+
+# Batch validation function
+def validate_multiple_oru_messages(messages: List[str]) -> Dict:
+    """Validate multiple ORU_R01 messages"""
+    results = {}
+    validator = ORU_R01Validator()
+    
+    for i, message in enumerate(messages):
+        print(f"\n{'='*50}")
+        print(f"Validating Message {i+1}")
+        print(f"{'='*50}")
+        
+        is_valid = validator.validate_oru_r01(message)
+        results[f"message_{i+1}"] = validator.get_validation_report()
+        validator.print_validation_report()
+        
+        # Reset validator for next message
+        validator = ORU_R01Validator()
+    
+    return results
+
+if __name__ == "__main__":
+    main()
