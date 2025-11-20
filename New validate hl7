@@ -1,0 +1,454 @@
+from hl7apy.parser import parse_message
+from hl7apy.exceptions import UnsupportedVersion, InvalidMessage, InvalidSegment, InvalidField
+from hl7apy import validation
+from typing import List, Dict, Optional, Any
+import re
+from datetime import datetime
+
+class DynamicORU_R01Validator:
+    def __init__(self, hl7_version: str = "2.5"):
+        self.hl7_version = hl7_version
+        self.errors = []
+        self.warnings = []
+        self.available_fields = {}  # Track which fields are actually present
+    
+    def validate_oru_r01(self, hl7_message: str) -> bool:
+        """
+        Dynamic validation for ORU_R01 messages with unknown field availability
+        """
+        self.errors = []
+        self.warnings = []
+        self.available_fields = {}
+        
+        try:
+            # Parse with lenient validation to handle missing fields
+            message = parse_message(
+                hl7_message, 
+                version=self.hl7_version,
+                validation_level=validation.NONE  # Start with no validation to parse successfully
+            )
+            
+            # Discover available segments and fields
+            self._discover_available_fields(message)
+            
+            # Run dynamic validations
+            self._validate_message_structure(message)
+            self._validate_available_msh_fields(message)
+            self._validate_available_patient_fields(message)
+            self._validate_available_order_fields(message)
+            self._validate_available_observation_fields(message)
+            self._validate_cross_field_relationships(message)
+            
+            return len(self.errors) == 0
+            
+        except Exception as e:
+            self.errors.append(f"Message parsing failed: {e}")
+            return False
+    
+    def _discover_available_fields(self, message):
+        """Discover which segments and fields are actually present in the message"""
+        for segment in message.children:
+            segment_name = segment.name
+            self.available_fields[segment_name] = {}
+            
+            for field in segment.children:
+                field_name = field.name
+                field_value = getattr(segment, field_name, None)
+                
+                # Check if field has a value
+                if field_value is not None and str(field_value).strip():
+                    self.available_fields[segment_name][field_name] = {
+                        'value': str(field_value),
+                        'raw_field': field_value
+                    }
+    
+    def _is_field_available(self, segment_name: str, field_name: str) -> bool:
+        """Check if a specific field is available in the segment"""
+        return (segment_name in self.available_fields and 
+                field_name in self.available_fields[segment_name])
+    
+    def _get_field_value(self, segment_name: str, field_name: str) -> Optional[str]:
+        """Safely get field value if available"""
+        if self._is_field_available(segment_name, field_name):
+            return self.available_fields[segment_name][field_name]['value']
+        return None
+    
+    def _validate_message_structure(self, message):
+        """Validate basic message structure with dynamic segment discovery"""
+        required_segments = ['MSH']  # Only MSH is truly required
+        
+        for segment_name in required_segments:
+            if segment_name not in self.available_fields:
+                self.errors.append(f"Required segment {segment_name} is missing")
+        
+        # Check for expected segments in ORU_R01
+        expected_segments = ['PID', 'PV1', 'OBR', 'OBX']
+        for segment_name in expected_segments:
+            if segment_name not in self.available_fields:
+                self.warnings.append(f"Expected segment {segment_name} is missing")
+        
+        # Check for at least one OBX segment
+        obx_count = len([seg for seg in message.children if seg.name == 'OBX'])
+        if obx_count == 0:
+            self.errors.append("At least one OBX segment is required for ORU_R01")
+    
+    def _validate_available_msh_fields(self, message):
+        """Validate MSH segment fields that are actually present"""
+        if 'MSH' not in self.available_fields:
+            return
+        
+        msh_fields = self.available_fields['MSH']
+        
+        # Conditionally required fields - only validate if present
+        conditional_required = {
+            'message_type': 'MSH.9',
+            'message_control_id': 'MSH.10',
+            'datetime_of_message': 'MSH.7',
+            'version_id': 'MSH.12'
+        }
+        
+        for field_attr, field_location in conditional_required.items():
+            if field_attr in msh_fields:
+                field_value = msh_fields[field_attr]['value']
+                if not field_value.strip():
+                    self.errors.append(f"{field_location} is present but empty")
+            else:
+                self.warnings.append(f"{field_location} is missing but recommended")
+        
+        # Validate message type if present
+        if 'message_type' in msh_fields:
+            msg_type = msh_fields['message_type']['value']
+            if 'ORU^R01' not in msg_type:
+                self.warnings.append(f"MSH.9 should be 'ORU^R01', found: {msg_type}")
+        
+        # Validate version if present
+        if 'version_id' in msh_fields:
+            version = msh_fields['version_id']['value']
+            supported_versions = ['2.1', '2.2', '2.3', '2.3.1', '2.4', '2.5', '2.5.1', '2.6', '2.7']
+            if version not in supported_versions:
+                self.warnings.append(f"Unsupported HL7 version: {version}")
+        
+        # Validate timestamp if present
+        if 'datetime_of_message' in msh_fields:
+            self._validate_timestamp(msh_fields['datetime_of_message']['value'], "MSH.7")
+    
+    def _validate_available_patient_fields(self, message):
+        """Validate patient-related fields that are actually present"""
+        # PID segment validation
+        if 'PID' in self.available_fields:
+            pid_fields = self.available_fields['PID']
+            
+            # Conditionally required PID fields
+            pid_recommended = {
+                'patient_identifier_list': 'PID.3',
+                'patient_name': 'PID.5',
+                'date_time_of_birth': 'PID.7',
+                'administrative_sex': 'PID.8'
+            }
+            
+            for field_attr, field_location in pid_recommended.items():
+                if field_attr in pid_fields:
+                    field_value = pid_fields[field_attr]['value']
+                    if not field_value.strip():
+                        self.errors.append(f"{field_location} is present but empty")
+                else:
+                    self.warnings.append(f"{field_location} is missing but recommended for patient identification")
+            
+            # Validate date of birth if present
+            if 'date_time_of_birth' in pid_fields:
+                self._validate_timestamp(pid_fields['date_time_of_birth']['value'], "PID.7")
+            
+            # Validate sex if present
+            if 'administrative_sex' in pid_fields:
+                sex_code = pid_fields['administrative_sex']['value']
+                valid_sex_codes = ['M', 'F', 'O', 'U', 'A', 'N']
+                if sex_code not in valid_sex_codes:
+                    self.warnings.append(f"PID.8 sex code '{sex_code}' not in standard values {valid_sex_codes}")
+        
+        # PV1 segment validation
+        if 'PV1' in self.available_fields:
+            pv1_fields = self.available_fields['PV1']
+            
+            if 'patient_class' in pv1_fields:
+                patient_class = pv1_fields['patient_class']['value']
+                valid_classes = ['I', 'O', 'E', 'P', 'R', 'B', 'C', 'N', 'U']
+                if patient_class not in valid_classes:
+                    self.warnings.append(f"PV1.2 patient class '{patient_class}' not in standard values {valid_classes}")
+    
+    def _validate_available_order_fields(self, message):
+        """Validate order-related fields that are actually present"""
+        # ORC segment validation
+        if 'ORC' in self.available_fields:
+            orc_fields = self.available_fields['ORC']
+            
+            if 'order_control' in orc_fields:
+                order_control = orc_fields['order_control']['value']
+                valid_order_controls = ['NW', 'OK', 'UA', 'CA', 'OC', 'CR', 'UC', 'DC', 'HD', 'HR']
+                if order_control not in valid_order_controls:
+                    self.warnings.append(f"ORC.1 order control '{order_control}' not in standard values {valid_order_controls}")
+        
+        # OBR segment validation
+        if 'OBR' in self.available_fields:
+            obr_fields = self.available_fields['OBR']
+            
+            # Critical OBR fields
+            obr_critical = {
+                'universal_service_identifier': 'OBR.4',
+                'observation_datetime': 'OBR.7',
+                'result_status': 'OBR.25'
+            }
+            
+            for field_attr, field_location in obr_critical.items():
+                if field_attr in obr_fields:
+                    field_value = obr_fields[field_attr]['value']
+                    if not field_value.strip():
+                        self.errors.append(f"{field_location} is present but empty")
+                else:
+                    self.errors.append(f"{field_location} is required for ORU_R01 messages")
+            
+            # Validate result status if present
+            if 'result_status' in obr_fields:
+                status = obr_fields['result_status']['value']
+                valid_statuses = ['O', 'I', 'S', 'A', 'P', 'C', 'R', 'N', 'D', 'X', 'Y', 'Z']
+                if status not in valid_statuses:
+                    self.warnings.append(f"OBR.25 result status '{status}' not in standard values {valid_statuses}")
+            
+            # Validate timestamp if present
+            if 'observation_datetime' in obr_fields:
+                self._validate_timestamp(obr_fields['observation_datetime']['value'], "OBR.7")
+    
+    def _validate_available_observation_fields(self, message):
+        """Validate OBX segments and their available fields"""
+        obx_segments = {}
+        
+        # Group OBX segments by their index
+        for seg_name, fields in self.available_fields.items():
+            if seg_name.startswith('OBX'):
+                obx_segments[seg_name] = fields
+        
+        for obx_seg_name, obx_fields in obx_segments.items():
+            # Critical OBX fields
+            obx_critical = {
+                'value_type': f'{obx_seg_name}.2',
+                'observation_identifier': f'{obx_seg_name}.3',
+                'observation_value': f'{obx_seg_name}.5',
+                'observation_result_status': f'{obx_seg_name}.11'
+            }
+            
+            for field_attr, field_location in obx_critical.items():
+                if field_attr in obx_fields:
+                    field_value = obx_fields[field_attr]['value']
+                    if not field_value.strip():
+                        self.errors.append(f"{field_location} is present but empty")
+                else:
+                    self.errors.append(f"{field_location} is required for observation data")
+            
+            # Validate value type if present
+            if 'value_type' in obx_fields:
+                value_type = obx_fields['value_type']['value']
+                valid_value_types = ['ST', 'TX', 'FT', 'NM', 'SN', 'DT', 'TM', 'TS', 'IS', 'CE', 'CWE', 'RP']
+                if value_type not in valid_value_types:
+                    self.warnings.append(f"{obx_seg_name}.2 value type '{value_type}' not in standard values {valid_value_types}")
+            
+            # Validate result status if present
+            if 'observation_result_status' in obx_fields:
+                status = obx_fields['observation_result_status']['value']
+                valid_statuses = ['F', 'N', 'D', 'X', 'C', 'R', 'S', 'P', 'A']
+                if status not in valid_statuses:
+                    self.warnings.append(f"{obx_seg_name}.11 result status '{status}' not in standard values {valid_statuses}")
+            
+            # Validate units if present
+            if 'units' in obx_fields:
+                units = obx_fields['units']['value']
+                if not re.match(r'^[A-Za-z0-9°%/\\.\s]+$', units):
+                    self.warnings.append(f"{obx_seg_name}.6 units format may be invalid: {units}")
+    
+    def _validate_cross_field_relationships(self, message):
+        """Validate relationships between available fields"""
+        # Check ORC-OBR consistency if both are present
+        if 'ORC' in self.available_fields and 'OBR' in self.available_fields:
+            orc_fields = self.available_fields['ORC']
+            obr_fields = self.available_fields['OBR']
+            
+            # Placer order number consistency
+            if ('placer_order_number' in orc_fields and 
+                'placer_order_number' in obr_fields):
+                orc_placer = orc_fields['placer_order_number']['value']
+                obr_placer = obr_fields['placer_order_number']['value']
+                if orc_placer != obr_placer:
+                    self.warnings.append("ORC.2 and OBR.2 placer order numbers should match")
+    
+    def _validate_timestamp(self, timestamp: str, field_location: str):
+        """Validate HL7 timestamp format"""
+        timestamp_pattern = r'^\d{4}([01]\d[0-3]\d)([0-2]\d[0-5]\d([0-5]\d)?)?(\.\d+)?([+-]\d{4})?$'
+        
+        if not re.match(timestamp_pattern, timestamp):
+            self.warnings.append(f"{field_location} timestamp format may be invalid: {timestamp}")
+        else:
+            try:
+                date_part = timestamp[:8]
+                if len(date_part) == 8:
+                    datetime.strptime(date_part, '%Y%m%d')
+            except ValueError:
+                self.warnings.append(f"{field_location} contains invalid date: {timestamp}")
+    
+    def get_available_fields_report(self) -> Dict:
+        """Generate report of all available fields"""
+        return self.available_fields
+    
+    def get_validation_report(self) -> Dict:
+        """Generate comprehensive validation report"""
+        return {
+            'is_valid': len(self.errors) == 0,
+            'error_count': len(self.errors),
+            'warning_count': len(self.warnings),
+            'available_fields': self.available_fields,
+            'errors': self.errors,
+            'warnings': self.warnings
+        }
+    
+    def print_detailed_report(self):
+        """Print detailed validation report with field availability"""
+        report = self.get_validation_report()
+        
+        print(f"\n{'='*70}")
+        print("DYNAMIC ORU_R01 VALIDATION REPORT")
+        print(f"{'='*70}")
+        
+        # Field availability summary
+        print("\n📊 FIELD AVAILABILITY SUMMARY:")
+        for segment_name, fields in self.available_fields.items():
+            print(f"   {segment_name}: {len(fields)} fields available")
+        
+        # Validation results
+        print(f"\n✅ VALIDATION RESULTS:")
+        print(f"   Overall: {'VALID' if report['is_valid'] else 'INVALID'}")
+        print(f"   Errors: {report['error_count']}, Warnings: {report['warning_count']}")
+        
+        if report['errors']:
+            print(f"\n❌ ERRORS:")
+            for error in report['errors']:
+                print(f"   • {error}")
+        
+        if report['warnings']:
+            print(f"\n⚠️  WARNINGS:")
+            for warning in report['warnings']:
+                print(f"   • {warning}")
+        
+        # Available fields details
+        print(f"\n🔍 AVAILABLE FIELDS DETAIL:")
+        for segment_name, fields in self.available_fields.items():
+            if fields:  # Only show segments with fields
+                print(f"   {segment_name}:")
+                for field_name, field_info in fields.items():
+                    value_preview = field_info['value'][:50] + "..." if len(field_info['value']) > 50 else field_info['value']
+                    print(f"     - {field_name}: {value_preview}")
+
+# Usage Examples with Different Message Scenarios
+
+def test_various_message_scenarios():
+    """Test validator with different message completeness levels"""
+    
+    # Scenario 1: Complete message
+    complete_message = """MSH|^~\\&|LAB_SYSTEM|LAB_FACILITY|HIS_SYSTEM|HOSPITAL|20240101143000||ORU^R01|MSG12345|P|2.5|||AL|NE
+PID|1|12345^^^HOSP^MR||PATIENT^SAMPLE^J||19850101|M|||123 MAIN ST^^CITY^ST^12345||(555)123-4567|
+PV1|1|O|OPD^101^^^HOSP||||123456^DOCTOR^JOHN^^^^^^MD|
+OBR|1|||LAB1234^COMPLETE BLOOD COUNT^LN|||20240101140000|||||||||||||||||||||F|
+OBX|1|NM|WBC^White Blood Cell Count^LN||7.5|10*3/uL|4.0-11.0|||F|||20240101141500|"""
+    
+    # Scenario 2: Minimal message (only required fields)
+    minimal_message = """MSH|^~\\&|SEND|FAC|RECV|FAC|202401011200||ORU^R01|123|P|2.3|
+OBR|1|||TEST^TEST^LN|||202401011200|||||||||||||||||||||F|
+OBX|1|ST|TEST^Test^LN||Result||||F|||"""
+    
+    # Scenario 3: Message with missing critical fields
+    problematic_message = """MSH|^~\\&|SEND|FAC|RECV|FAC|202401011200||ORU^R01|123|P|2.3|
+PID|1|||||||
+OBR|1||||||202401011200|||||||||||||||||||||
+OBX|1|||||||||||"""
+    
+    scenarios = {
+        "Complete Message": complete_message,
+        "Minimal Message": minimal_message,
+        "Problematic Message": problematic_message
+    }
+    
+    validator = DynamicORU_R01Validator(hl7_version="2.5")
+    
+    for scenario_name, message in scenarios.items():
+        print(f"\n{'#'*80}")
+        print(f"TESTING SCENARIO: {scenario_name}")
+        print(f"{'#'*80}")
+        
+        is_valid = validator.validate_oru_r01(message)
+        validator.print_detailed_report()
+        
+        # Reset for next message
+        validator = DynamicORU_R01Validator(hl7_version="2.5")
+
+# Function to handle unknown message types
+def validate_any_hl7_message(hl7_message: str, expected_message_type: str = None) -> Dict:
+    """
+    Generic validator for any HL7 message type when field availability is unknown
+    """
+    validator = DynamicORU_R01Validator()
+    
+    try:
+        # First, try to parse and discover the message type
+        message = parse_message(hl7_message, version="2.5", validation_level=validation.NONE)
+        
+        # Get actual message type
+        actual_msg_type = None
+        if 'MSH' in validator.available_fields and 'message_type' in validator.available_fields['MSH']:
+            actual_msg_type = validator.available_fields['MSH']['message_type']['value']
+        
+        # Validate based on expected type or discovered type
+        if expected_message_type and actual_msg_type and expected_message_type not in actual_msg_type:
+            validator.warnings.append(f"Expected message type {expected_message_type}, but found {actual_msg_type}")
+        
+        # Run generic validation
+        is_valid = validator.validate_oru_r01(hl7_message)
+        
+        result = validator.get_validation_report()
+        result['discovered_message_type'] = actual_msg_type
+        
+        return result
+        
+    except Exception as e:
+        return {
+            'is_valid': False,
+            'error_count': 1,
+            'warning_count': 0,
+            'errors': [f"Failed to parse message: {e}"],
+            'warnings': [],
+            'discovered_message_type': None
+        }
+
+if __name__ == "__main__":
+    test_various_message_scenarios()
+    
+    # Example of validating an unknown message
+    unknown_message = """MSH|^~\\&|SYS1|FAC1|SYS2|FAC2|202401011200||ADT^A01|123|P|2.3|
+EVN|A01|202401011200|
+PID|1|12345^^^FAC^MR||TEST^PATIENT^^^||19700101|M|||"""
+    
+    print(f"\n{'#'*80}")
+    print("VALIDATING UNKNOWN MESSAGE TYPE")
+    print(f"{'#'*80}")
+    
+    result = validate_any_hl7_message(unknown_message, "ORU^R01")
+    print(f"Discovered message type: {result.get('discovered_message_type', 'Unknown')}")
+    print(f"Is valid: {result['is_valid']}")
+    print(f"Errors: {result['errors']}")
+
+
+# For completely unknown messages
+validator = DynamicORU_R01Validator()
+result = validator.validate_oru_r01(your_hl7_message)
+
+# See what fields are available
+available_fields = validator.get_available_fields_report()
+print(f"Available segments: {list(available_fields.keys())}")
+
+# For generic HL7 validation
+result = validate_any_hl7_message(unknown_message, "ORU^R01")
